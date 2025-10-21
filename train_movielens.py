@@ -164,51 +164,96 @@ def collaborative_filtering_fill_custom(matrix, num_factors=20, num_iterations=5
 
 
 def generate_action_set(M, d):
+    """
+    Generate action set using NMF decomposition and clustering approach.
+    
+    Args:
+        M: Total number of tasks (including target)
+        d: Feature dimensionality
+    
+    Returns:
+        user_features: User feature matrix W (n_users x d)
+        Theta_star: Task parameter matrix (d x M) where each column is a task's theta
+        movie_cluster_assignments: Which cluster each movie belongs to
+        target_theta: Target task theta (linear combination of 2 source tasks)
+    """
     complete_rating = np.load("data/estimated_matrix.npy")
-    complete_rating = complete_rating / 5 
- 
-    model = NMF(n_components = int(np.sqrt(d)), init = 'nndsvda', max_iter = 10000)
-    W = model.fit_transform(complete_rating)
-    H = model.components_
- 
-    theta_true = np.eye(int(np.sqrt(d))).ravel()
-    Theta = np.tile(theta_true, (M, 1)).T
-    Theta[:, M - 2] = np.ones(d) / np.sqrt(d)
-    Theta[:, M - 1] = np.ones(d) / np.sqrt(d)
- 
-    kmeans = KMeans(n_clusters = M, random_state = 0).fit(H.T)
-    labels = kmeans.labels_
- 
-    Action_list = np.empty((W.shape[0], M), dtype = object)
- 
-    for t in range(W.shape[0]):
- 
-        for i in range(M):
+    complete_rating = complete_rating / 5.0  
+    n_users, n_items = complete_rating.shape
+    
+    nmf = NMF(n_components=d, init='random', random_state=42, max_iter=200)
+    W = nmf.fit_transform(complete_rating)  
+    H = nmf.components_.T  
+    
+    
+    
+    num_source_tasks = M - 1  
+    kmeans = KMeans(n_clusters=num_source_tasks, random_state=42, n_init=10)
+    movie_cluster_assignments = kmeans.fit_predict(H)
 
-            columns_cluster = np.where(labels == i)[0]
-            size = len(columns_cluster)
-            Action_list[t, i] = np.empty((size, d), dtype = float)
- 
-            for ac, column_idx in enumerate(columns_cluster):
+    cluster_centroids = kmeans.cluster_centers_
+
+    # Find any two linearly independent source tasks
+    def find_independent_tasks(centroids):
+        """
+        Find any two tasks whose theta vectors are linearly independent.
+        Returns the indices of the first pair found that are linearly independent.
+        """
+        num_tasks = centroids.shape[0]
+        
+        # Check pairs starting from the beginning
+        for i in range(num_tasks):
+            for j in range(i + 1, num_tasks):
+                theta_i = centroids[i]  # Shape: (d,)
+                theta_j = centroids[j]  # Shape: (d,)
                 
-                outer = np.outer(W[t], H[:, column_idx])
+                # Create matrix with the two vectors as columns
+                matrix = np.column_stack([theta_i, theta_j])  # Shape: (d, 2)
+                
+                # Check if they are linearly independent
+                rank = np.linalg.matrix_rank(matrix)
+                
+                if rank == 2:  # Both vectors are linearly independent
+                    return i, j
+        
+        # Fallback: if no independent pair found, return first two
+        print("Warning: No linearly independent pair found, using tasks 0 and 1")
+        return 0, 1
+    
+    # Find any linearly independent pair
+    source_task_1, source_task_2 = find_independent_tasks(cluster_centroids)
+    
+    print(f"Selected linearly independent tasks: {source_task_1} and {source_task_2}")
+    
+    # Verify linear independence
+    theta_1 = cluster_centroids[source_task_1]
+    theta_2 = cluster_centroids[source_task_2]
+    matrix = np.column_stack([theta_1, theta_2])
+    rank = np.linalg.matrix_rank(matrix)
 
-                if i == M - 2 or i == M - 1:
+    
+    alpha = 0.9
+    beta = 0.1
+    target_theta = alpha * cluster_centroids[source_task_1] + beta * cluster_centroids[source_task_2]
+    
 
-                    diag_values = W[t] * H[:, column_idx]
-                    Action_list[t, i][ac] = np.tile(diag_values[:, None], (1, int(np.sqrt(d)))).ravel()
+    Theta_star = np.zeros((d, M))
+    Theta_star[:, :num_source_tasks] = cluster_centroids.T  
+    Theta_star[:, -1] = target_theta  
 
-                else:
-
-                    Action_list[t, i][ac] = outer.ravel()
-                    
-    return Action_list, Theta
+    # print(Theta_star)
+    
+    
+    return W, Theta_star, movie_cluster_assignments, {
+        'source_task_1': source_task_1,
+        'source_task_2': source_task_2,
+        'alpha': alpha,
+        'beta': beta,
+        'target_theta': target_theta
+    }
 
 
 def get_config_filename(algo, params):
-    """
-    Generate config filename similar to MNIST-C.
-    """
     target_corruption = params["target_corruption"]
     target_label = params["target_label"]
     M = params["M"]
@@ -228,249 +273,272 @@ def get_config_filename(algo, params):
 
 def run_movielens_bandit_experiment():
     algorithms = ["altGD_ada", "altGD_no_ada", "chen", "mom", "collins"]  
-    k_list = [2] 
-    M = 80  
-    d = 100  
-    target_cluster = M - 1  
     
-    Action_list, Theta_star = generate_action_set(M, d)
+    M = 30 
+    d = 10 
     
-    all_results = {}
+    # Generate action set using NMF and clustering
+    user_features, Theta_star, movie_cluster_assignments, target_info = generate_action_set(M, d)
     
-    for k in k_list:
-        params = {}
-        params["d"] = d
-        params["k"] = k
-        params["M"] = M
-        params["epochs"] = 4
-        params["C"] = 3
-        params["c"] = 0.05
-        params["gd_iterations"] = 1000  
-        params["increase_gd_iteration"] = 10
-        params["num_source_sample"] = 2370 
-        params["num_target_sample"] = 20
-        params["samples_per_task"] = params["num_source_sample"] // (M - 1) 
-        params["learning_rate"] = 1e-6  
-        params["target_corruption"] = "movielens_cluster"
-        params["target_label"] = target_cluster
+    # Rank k is determined by the rank of Theta_star
+    # k = np.linalg.matrix_rank(Theta_star)
+    k = 2
+    print(f"Using rank k = {k} (determined by matrix rank of Theta_star)")
+    
+    # Setup parameters
+    params = {}
+    params["d"] = int(d)  
+    params["k"] = int(k)  
+    params["M"] = int(M - 1)  
+    params["epochs"] = 4
+    params["C"] = 3
+    params["c"] = 0.1
+    params["gd_iterations"] = 500  
+    params["increase_gd_iteration"] = 10
+    params["num_source_sample"] = 1450  # Total source samples across all tasks
+    params["num_target_sample"] = 20
+    params["samples_per_task"] = int(params["num_source_sample"] // (M - 1))  # Samples per source task
+    params["learning_rate"] = 1e-4  # Increased learning rate for better convergence
+    params["target_corruption"] = "movielens_nmf"
+    params["target_label"] = "target"
+    
+    # Pass target theta info to params for consistent evaluation
+    params["target_theta"] = target_info['target_theta'].tolist()
+    params["target_info"] = {
+        'source_task_1': int(target_info['source_task_1']),
+        'source_task_2': int(target_info['source_task_2']), 
+        'alpha': float(target_info['alpha']),
+        'beta': float(target_info['beta'])
+    }
+    
+    print(f"Generating task data for k={k}...")
+    epoch_source_data, epoch_source_labels, target_data, target_labels, order_tasks = generate_movielens_task_data(
+        user_features, Theta_star, movie_cluster_assignments, params
+    )
+    
+    # Use only source tasks for Theta_star (exclude target)
+    Theta_star_source = Theta_star[:, :-1]  # All columns except last (target)
+    
+    results = {}
+    
+    for algo in algorithms:
+        print(f"\n{'-'*30}")
+        print(f"Running {algo.upper()}")
+        print(f"{'-'*30}")
         
-        epoch_source_data, epoch_source_labels, target_data, target_labels, order_tasks = generate_movielens_task_data(
-            Action_list, Theta_star, params
-        )
-        
-        num_source_tasks = epoch_source_data.shape[1]  
-        params["M"] = num_source_tasks 
-        
-        source_tasks = [i for i in range(M) if i != target_cluster]
-        Theta_star_source = Theta_star[:, source_tasks] 
-
-        k_results = {}
-        
-        for algo in algorithms:
-            print(f"\n{'-'*30}")
-            print(f"Running {algo.upper()}")
-            print(f"{'-'*30}")
+        if algo == "altGD_ada":
+            run_alt_gd_min_ada(
+                epoch_source_data=epoch_source_data,
+                epoch_source_labels=epoch_source_labels,
+                target_data=target_data,
+                target_labels=target_labels,
+                order_tasks=order_tasks,
+                params=params.copy(),
+                Theta_star=Theta_star_source  
+            )
             
-            if algo == "altGD_ada":
-                run_alt_gd_min_ada(
-                    epoch_source_data=epoch_source_data,
-                    epoch_source_labels=epoch_source_labels,
-                    target_data=target_data,
-                    target_labels=target_labels,
-                    order_tasks=order_tasks,
-                    params=params.copy(),
-                    Theta_star=Theta_star_source  
-                )
-                
-            elif algo == "altGD_no_ada":
-                run_alt_gd_min_noada(
-                    epoch_source_data=epoch_source_data,
-                    epoch_source_labels=epoch_source_labels,
-                    target_data=target_data,
-                    target_labels=target_labels,
-                    order_tasks=order_tasks,
-                    params=params.copy(),
-                    Theta_star=Theta_star_source  
-                )
-                
-            elif algo == "chen":
-                run_chen(
-                    epoch_source_data=epoch_source_data,
-                    epoch_source_labels=epoch_source_labels,
-                    target_data=target_data,
-                    target_labels=target_labels,
-                    order_tasks=order_tasks,
-                    params=params.copy(),
-                    Theta_star=Theta_star_source  
-                )
-                
-            elif algo == "mom":
-                run_mom(
-                    epoch_source_data=epoch_source_data,
-                    epoch_source_labels=epoch_source_labels,
-                    target_data=target_data,
-                    target_labels=target_labels,
-                    order_tasks=order_tasks,
-                    params=params.copy(),
-                    Theta_star=Theta_star_source  
-                )
-                
-            elif algo == "collins":
-                run_Collins(
-                    epoch_source_data=epoch_source_data,
-                    epoch_source_labels=epoch_source_labels,
-                    target_data=target_data,
-                    target_labels=target_labels,
-                    order_tasks=order_tasks,
-                    params=params.copy()
-                )
-                
-            config_file = f"config/{get_config_filename(algo, params)}"
-            if os.path.exists(config_file):
-                with open(config_file, 'r') as f:
-                    result_data = json.load(f)
-                    if 'ER' in result_data:
-                        k_results[algo] = result_data['ER']
-                        print(f"{algo} completed. ER saved to config.")
-                    else:
-                        print(f"Warning: No ER found in {config_file}")
-            else:
-                print(f"Warning: Config file {config_file} not found")
-        
-        all_results[f"k_{k}"] = k_results
+        elif algo == "altGD_no_ada":
+            run_alt_gd_min_noada(
+                epoch_source_data=epoch_source_data,
+                epoch_source_labels=epoch_source_labels,
+                target_data=target_data,
+                target_labels=target_labels,
+                order_tasks=order_tasks,
+                params=params.copy(),
+                Theta_star=Theta_star_source  
+            )
+            
+        elif algo == "chen":
+            run_chen(
+                epoch_source_data=epoch_source_data,
+                epoch_source_labels=epoch_source_labels,
+                target_data=target_data,
+                target_labels=target_labels,
+                order_tasks=order_tasks,
+                params=params.copy(),
+                Theta_star=Theta_star_source  
+            )
+            
+        elif algo == "mom":
+            run_mom(
+                epoch_source_data=epoch_source_data,
+                epoch_source_labels=epoch_source_labels,
+                target_data=target_data,
+                target_labels=target_labels,
+                order_tasks=order_tasks,
+                params=params.copy(),
+                Theta_star=Theta_star_source  
+            )
+            
+        elif algo == "collins":
+            run_Collins(
+                epoch_source_data=epoch_source_data,
+                epoch_source_labels=epoch_source_labels,
+                target_data=target_data,
+                target_labels=target_labels,
+                order_tasks=order_tasks,
+                params=params.copy()
+            )
+            
+        config_file = f"config/{get_config_filename(algo, params)}"
+        if os.path.exists(config_file):
+            with open(config_file, 'r') as f:
+                result_data = json.load(f)
+                if 'ER' in result_data:
+                    results[algo] = result_data['ER']
+                    print(f"{algo} completed. ER saved to config.")
+                else:
+                    print(f"Warning: No ER found in {config_file}")
+        else:
+            print(f"Warning: Config file {config_file} not found")
+    
     
     print("\n" + "="*60)
-    print("MOVIELENS BANDIT EXPERIMENT RESULTS")
+    print("MOVIELENS NMF-BASED EXPERIMENT RESULTS")
     print("="*60)
     
-    for k_key, k_results in all_results.items():
-        print(f"\n{k_key.upper()}:")
-        for algo, er_result in k_results.items():
-            if er_result is not None:
-                if isinstance(er_result, list) and len(er_result) > 0:
-                    if isinstance(er_result[0], tuple):
-                        final_er = er_result[0][1][-1] if er_result[0][1] else "N/A"
-                    else:
-                        final_er = er_result[-1] if er_result else "N/A"
-                    print(f"  {algo}: Final ER = {final_er}")
+    # Print target task information
+    print(f"\nTarget Task Info:")
+    print(f"  Created as linear combination of source tasks {target_info['source_task_1']} and {target_info['source_task_2']}")
+    print(f"  Combination: {target_info['alpha']} * θ_{target_info['source_task_1']} + {target_info['beta']} * θ_{target_info['source_task_2']}")
+    print(f"  Using rank k = {k}")
+    
+    print(f"\nRESULTS:")
+    for algo, er_result in results.items():
+        if er_result is not None:
+            if isinstance(er_result, list) and len(er_result) > 0:
+                if isinstance(er_result[0], tuple):
+                    final_er = er_result[0][1][-1] if er_result[0][1] else "N/A"
                 else:
-                    print(f"  {algo}: ER = {er_result}")
+                    final_er = er_result[-1] if er_result else "N/A"
+                print(f"  {algo}: Final ER = {final_er}")
             else:
-                print(f"  {algo}: Failed")
+                print(f"  {algo}: ER = {er_result}")
+        else:
+            print(f"  {algo}: Failed")
     
     print(f"\nConfig files saved in config/ directory")
     print("="*60)
     
-    return all_results
-
-
-def generate_movielens_task_data(Action_list, Theta_star, params):
+    return results
+def generate_movielens_task_data(user_features, Theta_star, movie_cluster_assignments, params):
+    """
+    Generate task data using NMF-based approach.
+    
+    Args:
+        user_features: User feature matrix W (n_users x d)
+        Theta_star: Task parameter matrix (d x M) 
+        movie_cluster_assignments: Which cluster each movie belongs to
+        params: Experiment parameters
+    
+    Returns:
+        epoch_source_data, epoch_source_labels, target_data, target_labels, order_tasks
+    """
     epochs = params["epochs"]
-    M = params["M"]
+    M = params["M"]  # Number of source tasks
     num_source_sample = params["num_source_sample"]
     num_target_sample = params["num_target_sample"]
     d = params["d"]
-    target_cluster = params["target_label"]
+    samples_per_task = params["samples_per_task"]
     
-    np.random.seed(23)
+    np.random.seed(42)
     
-    n_users = Action_list.shape[0] 
+    n_users, d_features = user_features.shape
+    print(f"Generating task data from {n_users} users with {d_features} features")
     
-    source_tasks = [i for i in range(M) if i != target_cluster]
-    num_source_tasks = len(source_tasks)  # Should be M-1 = 79
-    samples_per_task = params["samples_per_task"]  # Samples per task
+    # Create order_tasks list for source tasks
+    order_tasks = [f"nmf_cluster_{i}" for i in range(M)]
     
-    order_tasks = [f"cluster_{i}" for i in source_tasks]
+    # Initialize epoch data arrays
+    epoch_source_data = np.zeros((epochs, M, samples_per_task, d))
+    epoch_source_labels = np.zeros((epochs, M, samples_per_task))
     
-    epoch_source_data = np.zeros((epochs, num_source_tasks, samples_per_task, d))
-    epoch_source_labels = np.zeros((epochs, num_source_tasks, samples_per_task))
+    print(f"Generating data for {M} source tasks with {samples_per_task} samples each...")
     
-    task_samples = {}
-    
-    for task_idx, cluster_id in enumerate(source_tasks):
-        cluster_samples = []
-        cluster_labels = []
-        cluster_theta = Theta_star[:, cluster_id]  
+    # Generate source task data
+    for task_idx in range(M):
+        task_theta = Theta_star[:, task_idx]  # Get theta for this source task
         
-        for _ in range(samples_per_task):
+        # Generate samples for this task
+        task_samples = []
+        task_labels = []
+        
+        for sample_idx in range(samples_per_task):
+            # Randomly select a user
             user_idx = np.random.choice(n_users)
+            user_feature = user_features[user_idx]  # Shape: (d,)
             
-            user_cluster_actions = Action_list[user_idx, cluster_id]
+            # Generate label: y = x^T * theta + noise
+            y_val = np.dot(user_feature, task_theta)
             
-            if hasattr(user_cluster_actions, '__len__') and len(user_cluster_actions) > 0:
-                action_idx = np.random.choice(len(user_cluster_actions))
-                selected_action = user_cluster_actions[action_idx]
-            else:
-                selected_action = np.random.randn(d) * 0.1
+            # Add small amount of noise
+            noise = np.random.normal(0, 0.01)
+            y_val += noise
             
-            if len(selected_action) != d:
-                selected_action = np.pad(selected_action, (0, max(0, d - len(selected_action))))[:d]
-            
-            # Compute label: Y_i = X_i * theta_star_i
-            y_val = np.dot(selected_action, cluster_theta)
-            
-            cluster_samples.append(selected_action)
-            cluster_labels.append(y_val)
+            task_samples.append(user_feature)
+            task_labels.append(y_val)
         
-        task_samples[task_idx] = {
-            'samples': np.array(cluster_samples),  
-            'labels': np.array(cluster_labels)     
-        }
+        # Convert to arrays
+        task_samples = np.array(task_samples)  # Shape: (samples_per_task, d)
+        task_labels = np.array(task_labels)    # Shape: (samples_per_task,)
+        
+        # Fill all epochs with the same data (consistent with MNIST-C approach)
+        for epoch in range(epochs):
+            epoch_source_data[epoch, task_idx] = task_samples
+            epoch_source_labels[epoch, task_idx] = task_labels
     
-    # Fill epoch data arrays with identical data for all epochs (like MNIST-C)
-    for epoch in range(epochs):
-        for task_idx in range(num_source_tasks):
-            epoch_source_data[epoch, task_idx] = task_samples[task_idx]['samples']
-            epoch_source_labels[epoch, task_idx] = task_samples[task_idx]['labels']
+    print(f"Generating target task data with {num_target_sample} samples...")
     
-    np.random.seed(42)  # Reset seed for target data consistency
+    # Generate target task data (using the last column of Theta_star as target theta)
+    target_theta = Theta_star[:, -1]  # Last column is target task theta
     target_data = np.zeros((num_target_sample, d))
     target_labels = np.zeros(num_target_sample)
-    target_theta = Theta_star[:, target_cluster]
     
     for sample_idx in range(num_target_sample):
+        # Randomly select a user
         user_idx = np.random.choice(n_users)
+        user_feature = user_features[user_idx]  # Shape: (d,)
         
-        user_cluster_actions = Action_list[user_idx, target_cluster]
+        # Generate label: y = x^T * theta + noise
+        y_val = np.dot(user_feature, target_theta)
         
-        if hasattr(user_cluster_actions, '__len__') and len(user_cluster_actions) > 0:
-            action_idx = np.random.choice(len(user_cluster_actions))
-            selected_action = user_cluster_actions[action_idx]
-        else:
-            selected_action = np.random.randn(d) * 0.1
+        # Add small amount of noise
+        noise = np.random.normal(0, 0.01)
+        y_val += noise
         
-        # Ensure correct shape
-        if len(selected_action) != d:
-            selected_action = np.pad(selected_action, (0, max(0, d - len(selected_action))))[:d]
-        
-        target_data[sample_idx] = selected_action
-        target_labels[sample_idx] = np.dot(selected_action, target_theta)
+        target_data[sample_idx] = user_feature
+        target_labels[sample_idx] = y_val
+    
+    print(f"Task data generation completed:")
+    print(f"  Source data shape: {epoch_source_data.shape}")
+    print(f"  Source labels shape: {epoch_source_labels.shape}")
+    print(f"  Target data shape: {target_data.shape}")
+    print(f"  Target labels shape: {target_labels.shape}")
     
     return epoch_source_data, epoch_source_labels, target_data, target_labels, order_tasks
 
 
 def run_all_target_experiments():
     """
-    Run MovieLens experiment with last task (task 29) as target and remaining 29 tasks as source.
+    Run MovieLens NMF-based experiment with adaptive sampling.
     """
     print("="*80)
-    print("RUNNING MOVIELENS EXPERIMENT - TASK 29 AS TARGET")
+    print("RUNNING MOVIELENS NMF-BASED EXPERIMENT")
+    print("Uses NMF decomposition + K-means clustering + linear combination target")
     print("="*80)
     
     try:
         results = run_movielens_bandit_experiment()
-        print(f"✅ Experiment completed successfully with task 29 as target")
-        return {"target_29": results}
+        print(f"✅ NMF-based experiment completed successfully")
+        return {"nmf_experiment": results}
         
     except Exception as e:
-        print(f"❌ Error in experiment: {str(e)}")
-        return {"target_29": {"error": str(e)}}
+        print(f"❌ Error in NMF-based experiment: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {"nmf_experiment": {"error": str(e)}}
 
 
-# Run the MovieLens experiment
+# Run the MovieLens NMF-based experiment
 if __name__ == "__main__":
-    # Run experiments for all 4 target clusters
     all_results = run_all_target_experiments()
-    print("\n" + "="*80)
-    print("ALL EXPERIMENTS COMPLETED!")
-    print("="*80)
